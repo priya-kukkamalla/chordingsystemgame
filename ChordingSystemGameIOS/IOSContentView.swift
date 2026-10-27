@@ -120,7 +120,7 @@ private let mixedWords = [
     "PEOPLE","SIMPLE","SAMPLE","STAPLE","TEMPLE","PURPLE","TRIPLE",
     "BEFORE","BETTER","BELONG","BESIDE","BEYOND","BEWAIL","BEWARE",
     "STREET","STRONG","STRIDE","STRIKE","STRING","STRAP","STRAW",
-    "FRIEND","FROZEN","FROWNS","FRAMES","France","FRIGHT","FRINGE",
+    "FRIEND","FROZEN","FROWNS","FRAMES","FRANCE","FRIGHT","FRINGE",
     "TOWARD","TRAVEL","TRACK","TRADE","TRAIN","TRAIT","TRAMP","TRANCE",
     "SCHOOL","SCREEN","SCRUB","SCREW","SCROLL","SCRIMP","SCRIM",
     "PROBLEM","PRODUCE","PROGRAM","PROJECT","PROMISE","PROMOTE","PROTECT",
@@ -449,9 +449,358 @@ let gameLevels: [GameLevel] = [
 ]
 
 
+// MARK: - Calibration Model
+//
+// One finger layout, learned from where your fingers actually land and persisted.
+// Positions are normalized 0...1 across the WHOLE screen, so fingers can rest anywhere.
+
+struct Landing {
+    let zone:  Int       // finger bit 1,2,4,8 (16 = thumb placement during calibration)
+    let point: CGPoint   // 0...1 relative to the chord panel (the full screen)
+}
+
+struct FingerLayout {
+    var cx: [CGFloat]
+    var cy: [CGFloat]
+    var devY: [CGFloat]
+    var placed: [Bool] = Array(repeating: true, count: 4)
+
+    static func defaults() -> FingerLayout {
+        FingerLayout(cx: (0..<4).map { 0.28 + 0.70 * (CGFloat($0) + 0.5) / 4 },
+                     cy: Array(repeating: 0.61, count: 4),
+                     devY: Array(repeating: 0.058, count: 4))
+    }
+    func halfH(_ i: Int) -> CGFloat { min(0.22, max(0.09, devY[i] * 3)) }
+    var placedIdx: [Int] { (0..<4).filter { placed[$0] } }
+}
+
+final class CalibrationModel: ObservableObject {
+    enum Placing { case thumb, finger(Int) }
+
+    private struct Stored: Codable {
+        var cx: [Double]; var cy: [Double]; var devY: [Double]
+        var thumbX: Double; var thumbY: Double
+    }
+    private struct Snapshot {
+        var layout: FingerLayout
+        var thumb: CGPoint; var thumbPlaced: Bool
+    }
+
+    private static let storeKey = "chordCalibration.v4"
+    private static let learnKey = "chordCalibration.learning"
+    static let defaultThumb = CGPoint(x: 0.14, y: 0.88)
+
+    @Published private(set) var layout: FingerLayout
+    @Published private(set) var thumbCenter: CGPoint
+    @Published private(set) var thumbPlaced: Bool = true
+    @Published var isLearning: Bool {
+        didSet { UserDefaults.standard.set(isLearning, forKey: Self.learnKey) }
+    }
+
+    /// Calibration accepts touches much farther from the zones.
+    var looseHitTest = false
+    /// While set, ANY touch is assigned to this target (the "one big area" placement steps).
+    var placing: Placing? = nil
+
+    private var calibrating = false
+    private var backup: Snapshot?
+
+    init() {
+        isLearning = UserDefaults.standard.object(forKey: Self.learnKey) as? Bool ?? true
+        if let data = UserDefaults.standard.data(forKey: Self.storeKey),
+           let s = try? JSONDecoder().decode(Stored.self, from: data),
+           s.cx.count == 4, s.cy.count == 4, s.devY.count == 4 {
+            layout = FingerLayout(cx: s.cx.map { CGFloat($0) }, cy: s.cy.map { CGFloat($0) },
+                                  devY: s.devY.map { CGFloat($0) })
+            thumbCenter = CGPoint(x: s.thumbX, y: s.thumbY)
+        } else {
+            layout = .defaults()
+            thumbCenter = Self.defaultThumb
+        }
+        constrain(&layout); constrainThumb()
+    }
+
+    func reset() {
+        calibrating = false; backup = nil; placing = nil
+        layout = .defaults()
+        thumbCenter = Self.defaultThumb
+        thumbPlaced = true
+        save()
+    }
+
+    // MARK: Calibration session lifecycle
+
+    func beginCalibration() {
+        backup = Snapshot(layout: layout, thumb: thumbCenter, thumbPlaced: thumbPlaced)
+        calibrating = true
+        layout.placed = Array(repeating: false, count: 4)
+        thumbPlaced = false
+    }
+    func endCalibration() {
+        calibrating = false; placing = nil; backup = nil
+        save()
+    }
+    func cancelCalibration() {
+        if let b = backup {
+            layout = b.layout; thumbCenter = b.thumb; thumbPlaced = b.thumbPlaced
+        }
+        calibrating = false; placing = nil; backup = nil
+    }
+
+    func placeThumb(at p: CGPoint) {
+        thumbCenter = p; thumbPlaced = true
+        constrainThumb(); save()
+    }
+    func place(finger: Int, at p: CGPoint) {
+        let i = finger.trailingZeroBitCount
+        guard i >= 0 && i < 4 else { return }
+        mutate { L in
+            L.cx[i] = p.x; L.cy[i] = p.y; L.devY[i] = 0.045; L.placed[i] = true
+        }
+    }
+
+    // MARK: Geometry (normalized 0...1 in panel space)
+
+    /// One optional rect per finger (nil = not placed yet). Widths follow the spacing
+    /// between neighbouring placed fingers.
+    func rects() -> [CGRect?] {
+        let L = layout
+        let idx = L.placedIdx
+        var out = [CGRect?](repeating: nil, count: 4)
+        for (k, i) in idx.enumerated() {
+            let x = L.cx[i]
+            let prev: CGFloat? = k > 0 ? L.cx[idx[k - 1]] : nil
+            let next: CGFloat? = k < idx.count - 1 ? L.cx[idx[k + 1]] : nil
+            var left: CGFloat, right: CGFloat
+            switch (prev, next) {
+            case let (p?, n?): left = (p + x) / 2;       right = (x + n) / 2
+            case let (p?, nil): left = (p + x) / 2;      right = x + (x - p) / 2
+            case let (nil, n?): left = x - (n - x) / 2;  right = (x + n) / 2
+            default:            left = x - 0.075;        right = x + 0.075
+            }
+            left = max(left, 0); right = min(right, 1)
+            let hh = L.halfH(i)
+            out[i] = CGRect(x: left, y: L.cy[i] - hh, width: max(right - left, 0.05), height: hh * 2)
+        }
+        return out
+    }
+
+    /// Nearest placed zone (generous radius so a drifted hand still registers).
+    func zoneID(at p: CGPoint) -> Int? {
+        switch placing {
+        case .thumb?:         return 16
+        case .finger(let f)?: return f
+        case nil:             break
+        }
+        var best: (idx: Int, d: CGFloat)?
+        for (i, maybe) in rects().enumerated() {
+            guard let r = maybe else { continue }
+            let dx = (p.x - r.midX) / (r.width / 2)
+            let dy = (p.y - r.midY) / (r.height / 2)
+            let d = hypot(dx, dy)
+            if best == nil || d < best!.d { best = (i, d) }
+        }
+        guard let b = best, b.d < (looseHitTest ? 8 : 2.2) else { return nil }
+        return 1 << b.idx
+    }
+
+    // MARK: Learning
+
+    /// Learn from one committed chord.
+    /// - correct: pair each landing with the zone it hit.
+    /// - wrong: if the finger count matches the expected chord, pair landings left→right
+    ///   with the expected fingers (lets the layout recover when it starts far off).
+    func learn(landings: [Landing], expectedMask: Int, correct: Bool,
+               boost: CGFloat = 1, force: Bool = false) {
+        guard isLearning || force, !landings.isEmpty else { return }
+        var pairs: [(Int, CGPoint)] = []
+        let rate: CGFloat
+
+        if correct {
+            pairs = landings.map { ($0.zone.trailingZeroBitCount, $0.point) }
+            rate = 0.15 * boost
+        } else {
+            let want = (0..<4).filter { expectedMask & (1 << $0) != 0 }
+            guard want.count == landings.count else { return }
+            let sorted = landings.sorted { $0.point.x < $1.point.x }
+            pairs = Array(zip(want, sorted.map { $0.point }))
+            rate = 0.08 * boost
+        }
+
+        let maxOff: CGFloat = force ? 0.45 : 0.25
+        let learned = pairs
+        mutate { L in
+            for (i, p) in learned where i >= 0 && i < 4 && L.placed[i] {
+                guard abs(p.x - L.cx[i]) < maxOff else { continue }   // ignore wild touches
+                L.cx[i] += (p.x - L.cx[i]) * rate
+                L.cy[i] += (p.y - L.cy[i]) * rate
+                L.devY[i] += (abs(p.y - L.cy[i]) - L.devY[i]) * 0.10
+            }
+        }
+    }
+
+    func learnThumb(globalPoint g: CGPoint, panel: CGRect, force: Bool = false) {
+        guard isLearning || force, thumbPlaced, panel.width > 1, panel.height > 1 else { return }
+        let rate: CGFloat = force ? 0.25 : 0.10
+        let p = CGPoint(x: (g.x - panel.minX) / panel.width, y: (g.y - panel.minY) / panel.height)
+        thumbCenter.x += (p.x - thumbCenter.x) * rate
+        thumbCenter.y += (p.y - thumbCenter.y) * rate
+        constrainThumb(); save()
+    }
+
+    // MARK: Internals
+
+    private func mutate(_ f: (inout FingerLayout) -> Void) {
+        var L = layout
+        f(&L); constrain(&L)
+        layout = L
+        save()
+    }
+
+    private func constrain(_ L: inout FingerLayout) {
+        let gap: CGFloat = 0.06
+        let idx = L.placedIdx
+        for i in 0..<4 {
+            L.devY[i] = min(max(L.devY[i], 0.03), 0.0733)
+            L.cx[i]   = min(max(L.cx[i], 0.05), 0.95)
+        }
+        if idx.count > 1 {
+            for k in 1..<idx.count { L.cx[idx[k]] = max(L.cx[idx[k]], L.cx[idx[k-1]] + gap) }
+            if let last = idx.last, L.cx[last] > 0.95 { L.cx[last] = 0.95 }
+            for k in stride(from: idx.count - 2, through: 0, by: -1) {
+                L.cx[idx[k]] = min(L.cx[idx[k]], L.cx[idx[k+1]] - gap)
+            }
+        }
+        for i in 0..<4 {
+            let hh = L.halfH(i)
+            L.cy[i] = min(max(L.cy[i], hh + 0.09), 1 - hh)   // keep clear of the top bar
+        }
+    }
+
+    private func constrainThumb() {
+        thumbCenter.x = min(max(thumbCenter.x, 0.11), 0.89)
+        thumbCenter.y = min(max(thumbCenter.y, 0.10), 0.92)
+    }
+
+    private func save() {
+        guard !calibrating else { return }   // only persist finished calibrations
+        let s = Stored(cx: layout.cx.map(Double.init), cy: layout.cy.map(Double.init),
+                       devY: layout.devY.map(Double.init),
+                       thumbX: Double(thumbCenter.x), thumbY: Double(thumbCenter.y))
+        if let d = try? JSONEncoder().encode(s) { UserDefaults.standard.set(d, forKey: Self.storeKey) }
+    }
+}
+
+// MARK: - Standalone Calibration Session
+//
+// Starts with one big blank touch area. You place the thumb first, then — with your
+// thumb resting on its button — each finger where it naturally sits. Zones appear where
+// you touch. The remaining steps refine every chord.
+
+final class CalibrationSession: ObservableObject {
+    enum Step: Equatable {
+        case placeThumb
+        case placeFinger(Int)      // finger bit
+        case chord(Int)            // mask
+        case thumbTap
+    }
+
+    private let calibration: CalibrationModel
+
+    @Published private(set) var steps: [Step] = []
+    @Published private(set) var index: Int = 0
+    @Published var wrongFlash = false
+
+    var finished: Bool { index >= steps.count }
+    var current: Step? { index < steps.count ? steps[index] : nil }
+    var progress: Double { steps.isEmpty ? 0 : Double(index) / Double(steps.count) }
+    var isPlacing: Bool {
+        switch current {
+        case .placeThumb?, .placeFinger?: return true
+        default: return false
+        }
+    }
+
+    init(calibration: CalibrationModel) {
+        self.calibration = calibration
+        calibration.beginCalibration()
+        build()
+    }
+
+    func restart() {
+        calibration.beginCalibration()
+        build()
+    }
+
+    func cancelIfUnfinished() {
+        if !finished { calibration.cancelCalibration() }
+        calibration.placing = nil
+    }
+
+    private func build() {
+        var s: [Step] = [.placeThumb]
+        s += [1, 2, 4, 8].map { Step.placeFinger($0) }
+        for _ in 0..<2 { s += [1, 2, 4, 8].shuffled().map { Step.chord($0) } }
+        s += [3, 5, 9, 6, 10, 12].shuffled().map { Step.chord($0) }
+        s += [7, 14, 11, 13, 15].shuffled().map { Step.chord($0) }
+        s += [Step.thumbTap, Step.thumbTap]
+        steps = s
+        index = 0
+        updatePlacing()
+    }
+
+    private func updatePlacing() {
+        switch current {
+        case .placeThumb?:        calibration.placing = .thumb
+        case .placeFinger(let f)?: calibration.placing = .finger(f)
+        default:                  calibration.placing = nil
+        }
+    }
+
+    private func advance() {
+        index += 1
+        haptic(.light)
+        if finished { calibration.endCalibration() } else { updatePlacing() }
+    }
+
+    private func reject() {
+        haptic(.rigid)
+        wrongFlash = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.wrongFlash = false }
+    }
+
+    func handleChord(mask: Int, landings: [Landing]) {
+        guard let step = current, let first = landings.first else { return }
+        switch step {
+        case .placeThumb:
+            withAnimation(.easeOut(duration: 0.25)) { calibration.placeThumb(at: first.point) }
+            advance()
+
+        case .placeFinger(let f):
+            withAnimation(.easeOut(duration: 0.25)) { calibration.place(finger: f, at: first.point) }
+            advance()
+
+        case .chord(let want):
+            let ok = mask == want
+            calibration.learn(landings: landings, expectedMask: want, correct: ok,
+                              boost: 1.6, force: true)
+            if ok { advance() } else { reject() }
+
+        case .thumbTap:
+            break
+        }
+    }
+
+    func handleThumbTap() {
+        guard case .thumbTap? = current else { return }
+        advance()
+    }
+}
+
+
 // MARK: - Game Engine
 
-enum GamePhase { case intro, playing, levelComplete, gameComplete }
+enum GamePhase { case intro, playing, levelComplete, gameComplete, calibrating }
 
 class GameEngine: ObservableObject {
     @Published var phase: GamePhase = .intro
@@ -468,6 +817,10 @@ class GameEngine: ObservableObject {
     @Published var wrongChar: String = ""
 
     enum FeedbackKind { case correct, wrong, levelUp }
+
+    /// Called for every letter chord with whether it matched, and the chord that was expected.
+    /// Used by the calibration model to learn finger positions.
+    var onResult: ((_ correct: Bool, _ expectedMask: Int) -> Void)?
 
     private var timer: Timer?
     private var usedTargets: [String] = []
@@ -498,6 +851,11 @@ class GameEngine: ObservableObject {
         if isLetterMode { return chordFor(target) }
         if isWordMode || isSentenceMode { return chordFor(nextExpected) }
         return nil
+    }
+
+    /// The chord the player should be pressing right now (ignores showHint).
+    var expectedChord: (mask: Int, layer2: Bool)? {
+        isLetterMode ? chordFor(target) : chordFor(nextExpected)
     }
 
     var progress: Double {
@@ -539,18 +897,22 @@ class GameEngine: ObservableObject {
     func receiveLetter(_ letter: String) {
         guard phase == .playing else { return }
         wrongChar = ""
+        let expected = expectedChord?.mask ?? 0   // capture before the target changes
 
         if isLetterMode {
-            if letter == target { correct() } else { wrong(letter) }
+            if letter == target { onResult?(true, expected); correct() }
+            else { onResult?(false, expected); wrong(letter) }
             return
         }
 
         // Word / sentence: append if matches next expected char
         if typed.count < target.count {
             if letter == nextExpected {
+                onResult?(true, expected)
                 typed += letter
                 checkWordOrSentenceComplete()
             } else {
+                onResult?(false, expected)
                 wrong(letter)
             }
         }
@@ -561,10 +923,12 @@ class GameEngine: ObservableObject {
         guard isWordMode || isSentenceMode else { return }
 
         if typed.count < target.count && nextExpected == " " {
+            onResult?(true, 1)
             typed += " "
             checkWordOrSentenceComplete()
         } else if isWordMode && typed == target {
             // Allow trailing space to confirm word
+            onResult?(true, 1)
             correct()
         } else if isSentenceMode && typed.count < target.count {
             wrong(" ")
@@ -574,7 +938,7 @@ class GameEngine: ObservableObject {
     func receiveBackspace() {
         guard phase == .playing else { return }
         guard isWordMode || isSentenceMode else { return }
-        if !typed.isEmpty { typed.removeLast(); wrongChar = "" }
+        if !typed.isEmpty { onResult?(true, 2); typed.removeLast(); wrongChar = "" }
     }
 
     private func checkWordOrSentenceComplete() {
@@ -638,11 +1002,19 @@ class ChordEngine: NSObject, ObservableObject {
     @Published var activeMask: Int = 0
     @Published var layer2Active: Bool = false
     @Published var flashKey: String? = nil
-    var thumbHeld: Bool = false
+    @Published var thumbHeld: Bool = false
 
     var onLetter:    ((String) -> Void)?
     var onSpace:     (() -> Void)?
     var onBackspace: (() -> Void)?
+
+    /// Calibration hooks. When `onRawChord` is set, chords are delivered raw
+    /// (mask + landing points) instead of being turned into letters.
+    var onRawChord:  ((Int, [Landing]) -> Void)?
+    var onThumbTap:  (() -> Void)?
+
+    /// Landing points of the chord currently being delivered to onLetter.
+    var pendingLandings: [Landing] = []
 
     var previewLabel: String {
         guard activeMask != 0 else { return "" }
@@ -658,26 +1030,39 @@ class ChordEngine: NSObject, ObservableObject {
 
     func updateMask(_ mask: Int) { activeMask = mask }
 
-    func commit(mask: Int) {
+    func commit(mask: Int, landings: [Landing] = []) {
         guard mask != 0 else { return }
+        // Calibration gets raw chords (with landing points and thumb state)
+        if let raw = onRawChord { raw(mask, landings); return }
         if thumbHeld, let special = thumbChords[mask] {
             flash(specialDisplay(special)); haptic(.medium)
+            pendingLandings = landings
             switch special {
             case "space":      onSpace?()
             case "backspace":  onBackspace?()
             default: break
             }
+            pendingLandings = []
             return
         }
         if let ch = (layer2Active ? layer2 : layer1)[mask] {
-            flash(ch); haptic(.light); onLetter?(ch)
+            flash(ch); haptic(.light)
+            pendingLandings = landings
+            onLetter?(ch)
+            pendingLandings = []
         } else {
             haptic(.rigid); flash("?")
         }
     }
 
-    func toggleLayer()          { layer2Active.toggle(); haptic(.rigid); flash(layer2Active ? "L2":"L1") }
-    func thumbSpaceAlone()      { flash("⎵"); haptic(.medium); onSpace?() }
+    func toggleLayer() {
+        layer2Active.toggle(); haptic(.rigid); flash(layer2Active ? "L2":"L1")
+        onThumbTap?()
+    }
+    func thumbSpaceAlone() {
+        guard onRawChord == nil else { return }
+        flash("⎵"); haptic(.medium); onSpace?()
+    }
 
     private func flash(_ t: String) {
         withAnimation(.easeOut(duration: 0.06)) { flashKey = t }
@@ -695,22 +1080,37 @@ class ChordEngine: NSObject, ObservableObject {
     }
 }
 
-// MARK: - Multi-Touch Tracker
+// MARK: - Multi-Touch Tracker (calibration-aware)
 
 class ChordTracker: UIView {
     var onMaskChange: ((Int) -> Void)?
-    var onCommit:     ((Int) -> Void)?
-    var fingerRects: [Int: CGRect] = [:]
+    var onCommit:     ((Int, [Landing]) -> Void)?
+    var calibration:  CalibrationModel?
+    var panelFrame:   CGRect = .zero          // global coords of the chord panel
+
     private var activeTouches: [UITouch: Int] = [:]
+    private var landings: [Landing] = []
     private var peakMask: Int = 0
     private var everMulti = false
     private let singleRelease: TimeInterval = 0.040
     private let multiRelease:  TimeInterval = 0.110
     private var releaseTimer: Timer?
 
+    private func norm(_ t: UITouch) -> CGPoint {
+        let g = t.location(in: nil)   // window coordinates
+        return CGPoint(x: (g.x - panelFrame.minX) / max(panelFrame.width, 1),
+                       y: (g.y - panelFrame.minY) / max(panelFrame.height, 1))
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         releaseTimer?.invalidate(); releaseTimer = nil
-        for t in touches { if let z = hitZone(t.location(in: self)) { activeTouches[t] = z } }
+        for t in touches {
+            let p = norm(t)
+            if let z = calibration?.zoneID(at: p) {
+                activeTouches[t] = z
+                landings.append(Landing(zone: z, point: p))
+            }
+        }
         let cur = currentMask()
         if cur.nonzeroBitCount > 1 { everMulti = true }
         if cur.nonzeroBitCount > peakMask.nonzeroBitCount { peakMask = cur }
@@ -719,7 +1119,7 @@ class ChordTracker: UIView {
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         var changed = false
         for t in touches {
-            if let z = hitZone(t.location(in: self)) {
+            if let z = calibration?.zoneID(at: norm(t)) {
                 let old = activeTouches[t] ?? 0
                 if old != z { activeTouches[t] = z; changed = true }
             }
@@ -744,28 +1144,31 @@ class ChordTracker: UIView {
         releaseTimer?.invalidate()
         releaseTimer = Timer.scheduledTimer(withTimeInterval: d, repeats: false) { [weak self] _ in
             guard let self, self.activeTouches.isEmpty else { return }
-            let mask = self.peakMask; self.resetGesture()
-            if mask != 0 { self.onCommit?(mask) }
+            let mask = self.peakMask, samples = self.landings
+            self.resetGesture()
+            if mask != 0 { self.onCommit?(mask, samples) }
         }
     }
     private func resetGesture() {
-        activeTouches.removeAll(); peakMask = 0; everMulti = false
+        activeTouches.removeAll(); landings.removeAll()
+        peakMask = 0; everMulti = false
         releaseTimer?.invalidate(); releaseTimer = nil
     }
-    private func hitZone(_ pt: CGPoint) -> Int? { fingerRects.first { $0.value.contains(pt) }?.key }
     private func currentMask() -> Int { activeTouches.values.reduce(0, |) }
     override var isMultipleTouchEnabled: Bool { get { true } set {} }
 }
 
 struct ChordSurface: UIViewRepresentable {
-    var fingerRects: [Int: CGRect]
+    var calibration: CalibrationModel
+    var panelFrame: CGRect
     var onMaskChange: (Int) -> Void
-    var onCommit:     (Int) -> Void
+    var onCommit:     (Int, [Landing]) -> Void
     func makeUIView(context: Context) -> ChordTracker {
         let v = ChordTracker(); v.isMultipleTouchEnabled = true; v.backgroundColor = .clear; return v
     }
     func updateUIView(_ v: ChordTracker, context: Context) {
-        v.fingerRects = fingerRects; v.onMaskChange = onMaskChange; v.onCommit = onCommit
+        v.calibration = calibration; v.panelFrame = panelFrame
+        v.onMaskChange = onMaskChange; v.onCommit = onCommit
     }
 }
 
@@ -788,13 +1191,6 @@ struct RoundedCornerShape: InsettableShape {
                           cornerRadii: CGSize(width: radius, height: radius)).cgPath)
     }
     func inset(by amount: CGFloat) -> RoundedCornerShape { var s = self; s.insetAmount += amount; return s }
-}
-
-struct FingerRectsKey: PreferenceKey {
-    static var defaultValue: [Int: CGRect] = [:]
-    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
-        value.merge(nextValue()) { $1 }
-    }
 }
 
 // MARK: - Zone View
@@ -837,6 +1233,7 @@ struct FingerZoneView: View {
 struct ThumbButton: View {
     @ObservedObject var engine: ChordEngine
     let onTap: () -> Void; let onHold: () -> Void
+    var onTouch: ((CGPoint) -> Void)? = nil      // global press location (for calibration)
     let color = Color(red: 0.85, green: 0.38, blue: 0.22)
     @State private var holdTimer: Timer?
     @State private var holdFired = false
@@ -859,7 +1256,7 @@ struct ThumbButton: View {
         .scaleEffect(isPressed ? 0.96 : 1.0)
         .animation(.easeInOut(duration: 0.05), value: isPressed)
         .simultaneousGesture(
-            DragGesture(minimumDistance: 0)
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
                 .onChanged { _ in
                     guard !isPressed else { return }
                     isPressed = true; holdFired = false
@@ -868,69 +1265,90 @@ struct ThumbButton: View {
                         holdFired = true; onHold(); haptic(.heavy)
                     }
                 }
-                .onEnded { _ in
+                .onEnded { v in
                     isPressed = false; engine.thumbHeld = false
                     holdTimer?.invalidate(); holdTimer = nil
                     if !holdFired { onTap() }
                     holdFired = false
+                    onTouch?(v.startLocation)
                 }
         )
     }
 }
 
-// MARK: - Chord Input Panel
+// MARK: - Chord Input Panel (adaptive layout)
 
 struct ChordInputPanel: View {
     @ObservedObject var engine: ChordEngine
+    @ObservedObject var calibration: CalibrationModel
     var hintMask:   Int  = 0
     var hintLayer2: Bool = false
-    @State private var fingerRects: [Int: CGRect] = [:]
+    var forceLearning: Bool = false     // true inside the calibration screen
+    var showBigArea:   Bool = false     // calibration placement: one big blank touch area
 
     var body: some View {
         GeometryReader { geo in
             let W = geo.size.width, H = geo.size.height
-            let stripLeft:  CGFloat = W * 0.28
-            let stripTop:   CGFloat = H * 0.04
-            let stripWidth: CGFloat = W - stripLeft - 12
-            let stripH:     CGFloat = H * 0.58
-            let zoneW = stripWidth / CGFloat(fingerZones.count)
-            let thumbW: CGFloat = W * 0.26
-            let thumbH: CGFloat = H * 0.30
+            let panelFrame = geo.frame(in: .global)
+            let thumbW: CGFloat = W * 0.22
+            let thumbH: CGFloat = H * 0.17
+            let rects = calibration.rects()
+            let tc = calibration.thumbCenter
 
             ZStack(alignment: .topLeading) {
-                ChordSurface(fingerRects: fingerRects,
+                ChordSurface(calibration: calibration,
+                             panelFrame: panelFrame,
                              onMaskChange: { engine.updateMask($0) },
-                             onCommit:    { engine.commit(mask: $0) })
+                             onCommit:     { engine.commit(mask: $0, landings: $1) })
                     .frame(width: W, height: H).ignoresSafeArea()
 
-                ForEach(Array(fingerZones.enumerated()), id: \.element.id) { idx, zone in
-                    let x = stripLeft + CGFloat(idx) * zoneW
-                    let corners: UIRectCorner = idx == 0 ? [.topLeft,.bottomLeft]
-                                              : idx == fingerZones.count-1 ? [.topRight,.bottomRight] : []
-                    FingerZoneView(zone: zone,
-                                   isActive: engine.activeMask & zone.id != 0,
-                                   isHinted: hintMask & zone.id != 0,
-                                   roundedCorners: corners)
-                        .frame(width: zoneW, height: stripH)
-                        .offset(x: x, y: stripTop)
-                        .background(
-                            GeometryReader { zg in
-                                Color.clear.preference(key: FingerRectsKey.self,
-                                                       value: [zone.id: zg.frame(in: .global)])
-                            }
-                            .frame(width: zoneW, height: stripH).offset(x: x, y: stripTop)
-                        )
+                if showBigArea {
+                    RoundedRectangle(cornerRadius: 16)
+                        .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [6, 6]))
+                        .foregroundColor(Color(white: 0.22))
+                        .frame(width: W - 8, height: H - 8)
+                        .offset(x: 4, y: 4)
                         .allowsHitTesting(false)
                 }
 
-                ThumbButton(engine: engine,
-                            onTap:  { engine.toggleLayer() },
-                            onHold: { engine.thumbSpaceAlone() })
-                    .frame(width: thumbW, height: H * 0.30)
-                    .offset(x: 12, y: H - H * 0.30 - 12)
+                ForEach(0..<4, id: \.self) { idx in
+                    if let r = rects[idx] {
+                        FingerZoneView(zone: fingerZones[idx],
+                                       isActive: engine.activeMask & fingerZones[idx].id != 0,
+                                       isHinted: hintMask & fingerZones[idx].id != 0,
+                                       roundedCorners: .allCorners)
+                            .frame(width: max(r.width * W - 4, 10), height: r.height * H)
+                            .offset(x: r.minX * W + 2, y: r.minY * H)
+                            .animation(.easeOut(duration: 0.15), value: r)
+                            .transition(.scale(scale: 0.6).combined(with: .opacity))
+                            .allowsHitTesting(false)
+                    }
+                }
+
+                if calibration.thumbPlaced {
+                    ThumbButton(engine: engine,
+                                onTap:  { engine.toggleLayer() },
+                                onHold: { engine.thumbSpaceAlone() },
+                                onTouch: { calibration.learnThumb(globalPoint: $0, panel: panelFrame,
+                                                                  force: forceLearning) })
+                        .frame(width: thumbW, height: thumbH)
+                        .offset(x: tc.x * W - thumbW / 2, y: tc.y * H - thumbH / 2)
+                        .animation(.easeOut(duration: 0.25), value: tc)
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+                }
 
                 // Layer / preview status
                 HStack(spacing: 6) {
+                    if calibration.isLearning || forceLearning {
+                        Text("ADAPT")
+                            .font(.system(size: 8, weight: .black, design: .monospaced))
+                            .foregroundColor(Color(red: 0.22, green: 0.75, blue: 0.50).opacity(0.8))
+                    }
+                    if engine.thumbHeld {
+                        Text("THUMB")
+                            .font(.system(size: 8, weight: .black, design: .monospaced))
+                            .foregroundColor(Color(red: 0.85, green: 0.38, blue: 0.22).opacity(0.9))
+                    }
                     if hintLayer2 && !engine.layer2Active {
                         Text("tap thumb → L2")
                             .font(.system(size: 9))
@@ -947,15 +1365,9 @@ struct ChordInputPanel: View {
                         .foregroundColor(Color(white: 0.28))
                         .frame(minWidth: 28, alignment: .trailing)
                 }
-                .padding(.trailing, 12).padding(.top, 8)
-                .frame(width: W, alignment: .trailing)
+                .padding(.trailing, 12).padding(.bottom, 8)
+                .frame(width: W, height: H, alignment: .bottomTrailing)
                 .allowsHitTesting(false)
-            }
-            .onPreferenceChange(FingerRectsKey.self) { g in
-                let o = geo.frame(in: .global).origin
-                fingerRects = g.mapValues {
-                    CGRect(x: $0.minX-o.x, y: $0.minY-o.y, width: $0.width, height: $0.height)
-                }
             }
         }
     }
@@ -966,6 +1378,7 @@ struct ChordInputPanel: View {
 struct LevelSelectView: View {
     @ObservedObject var game: GameEngine
     let onSelect: (Int) -> Void
+    let onCalibrate: () -> Void
 
     // Section order
     private let sections = ["Layer 1", "Layer 2", "Both Layers", "Words", "Sentences"]
@@ -982,12 +1395,25 @@ struct LevelSelectView: View {
             Color(red: 0.06, green: 0.06, blue: 0.09).ignoresSafeArea()
             VStack(spacing: 0) {
                 // Header
-                HStack {
+                HStack(spacing: 12) {
                     Text("CHORD TRAINER")
                         .font(.system(size: 12, weight: .black, design: .monospaced))
                         .foregroundColor(Color(white: 0.45))
                         .tracking(3)
                     Spacer()
+                    Button(action: onCalibrate) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "scope").font(.system(size: 9))
+                            Text("CALIBRATE")
+                                .font(.system(size: 9, weight: .black, design: .monospaced))
+                                .tracking(1)
+                        }
+                        .foregroundColor(Color(red: 0.22, green: 0.75, blue: 0.50))
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(Color(white: 0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    .buttonStyle(.plain)
                     if game.bestStreak > 0 {
                         HStack(spacing: 3) {
                             Image(systemName: "flame.fill")
@@ -1104,6 +1530,7 @@ struct LevelCard: View {
 struct PlayingView: View {
     @ObservedObject var game: GameEngine
     @ObservedObject var engine: ChordEngine
+    @ObservedObject var calibration: CalibrationModel
     let onMenu: () -> Void
 
     var hint: (mask: Int, layer2: Bool)? { game.hintForTarget }
@@ -1118,9 +1545,17 @@ struct PlayingView: View {
 
                 // Feedback bg
                 if let fb = game.feedback {
-                    feedbackColor(fb).ignoresSafeArea()
+                    feedbackColor(fb).ignoresSafeArea().allowsHitTesting(false)
                         .transition(.opacity).animation(.easeOut(duration: 0.12), value: game.feedback != nil)
                 }
+
+                // Chord panel — the whole screen is the touch area, so fingers
+                // can rest in the top half when the thumb is held.
+                ChordInputPanel(engine: engine,
+                                calibration: calibration,
+                                hintMask:   hint?.mask   ?? 0,
+                                hintLayer2: hint?.layer2 ?? false)
+                    .frame(width: W, height: H)
 
                 // Info area
                 VStack(spacing: 0) {
@@ -1129,6 +1564,19 @@ struct PlayingView: View {
                         Button(action: onMenu) {
                             Image(systemName: "list.bullet")
                                 .font(.system(size: 13))
+                                .foregroundColor(Color(white: 0.30))
+                        }
+                        // Adaptive layout toggle
+                        Button { calibration.isLearning.toggle(); haptic(.light) } label: {
+                            Image(systemName: "scope")
+                                .font(.system(size: 13))
+                                .foregroundColor(calibration.isLearning
+                                    ? Color(red: 0.22, green: 0.75, blue: 0.50) : Color(white: 0.30))
+                        }
+                        // Reset layout
+                        Button { calibration.reset(); haptic(.rigid) } label: {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 12))
                                 .foregroundColor(Color(white: 0.30))
                         }
                         VStack(alignment: .leading, spacing: 0) {
@@ -1171,20 +1619,15 @@ struct PlayingView: View {
                         }
                     }
                     .frame(height: 3).padding(.horizontal, 14)
+                    .allowsHitTesting(false)
 
                     Spacer()
                     GameTargetView(game: game)
                         .modifier(ShakeModifier(shaking: game.wrongShake))
+                        .allowsHitTesting(false)
                     Spacer()
                 }
                 .frame(width: W, height: infoH)
-
-                // Chord panel
-                ChordInputPanel(engine: engine,
-                                hintMask:   hint?.mask   ?? 0,
-                                hintLayer2: hint?.layer2 ?? false)
-                    .frame(width: W, height: H - infoH)
-                    .offset(y: infoH)
 
                 // Engine flash
                 if let flash = engine.flashKey {
@@ -1206,6 +1649,185 @@ struct PlayingView: View {
         case .wrong:    return Color(red: 0.80, green: 0.15, blue: 0.15).opacity(0.16)
         case .levelUp:  return Color(red: 0.94, green: 0.72, blue: 0.18).opacity(0.18)
         }
+    }
+}
+
+// MARK: - Calibration View (standalone mode)
+
+struct CalibrationView: View {
+    @ObservedObject var engine: ChordEngine
+    @ObservedObject var calibration: CalibrationModel
+    @StateObject private var session: CalibrationSession
+    let onExit: () -> Void
+
+    init(engine: ChordEngine, calibration: CalibrationModel, onExit: @escaping () -> Void) {
+        _engine = ObservedObject(wrappedValue: engine)
+        _calibration = ObservedObject(wrappedValue: calibration)
+        _session = StateObject(wrappedValue: CalibrationSession(calibration: calibration))
+        self.onExit = onExit
+    }
+
+    private var hintMask: Int {
+        if case .chord(let m)? = session.current { return m }
+        return 0
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let W = geo.size.width, H = geo.size.height
+
+            ZStack(alignment: .topLeading) {
+                Color(red: 0.06, green: 0.06, blue: 0.09).ignoresSafeArea()
+
+                if session.wrongFlash {
+                    Color(red: 0.80, green: 0.15, blue: 0.15).opacity(0.14)
+                        .ignoresSafeArea().allowsHitTesting(false)
+                }
+
+                if session.finished {
+                    finishedView.frame(width: W, height: H)
+                } else {
+                    // The whole screen is the touch area, so fingers can rest anywhere.
+                    ChordInputPanel(engine: engine,
+                                    calibration: calibration,
+                                    hintMask: hintMask,
+                                    hintLayer2: false,
+                                    forceLearning: true,
+                                    showBigArea: session.isPlacing)
+                        .frame(width: W, height: H)
+
+                    VStack(spacing: 0) {
+                        HStack(spacing: 10) {
+                            Button(action: onExit) {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(Color(white: 0.30))
+                            }
+                            Text("CALIBRATION")
+                                .font(.system(size: 10, weight: .black, design: .monospaced))
+                                .foregroundColor(Color(red: 0.22, green: 0.75, blue: 0.50))
+                                .tracking(2)
+                            Spacer()
+                            Text("\(session.index + 1)/\(session.steps.count)")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .foregroundColor(Color(white: 0.40))
+                        }
+                        .padding(.horizontal, 14).padding(.top, 8).padding(.bottom, 6)
+
+                        GeometryReader { pg in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color(white: 0.11)).frame(height: 3)
+                                Capsule()
+                                    .fill(Color(red: 0.22, green: 0.75, blue: 0.50))
+                                    .frame(width: pg.size.width * session.progress, height: 3)
+                                    .animation(.spring(response: 0.3), value: session.index)
+                            }
+                        }
+                        .frame(height: 3).padding(.horizontal, 14)
+                        .allowsHitTesting(false)
+                    }
+                    .frame(width: W)
+
+                    // Prompt lives in the free left column so it never covers the finger zones.
+                    promptView
+                        .frame(width: W * 0.26, alignment: .leading)
+                        .offset(x: 14, y: H * 0.16)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+        .onAppear {
+            calibration.looseHitTest = true
+            engine.layer2Active = false
+            engine.onRawChord = { mask, landings in
+                session.handleChord(mask: mask, landings: landings)
+            }
+            engine.onThumbTap = {
+                session.handleThumbTap()
+                engine.layer2Active = false
+            }
+        }
+        .onDisappear {
+            session.cancelIfUnfinished()
+            calibration.looseHitTest = false
+            engine.onRawChord = nil
+            engine.onThumbTap = nil
+            engine.layer2Active = false
+        }
+    }
+
+    // MARK: Prompts
+
+    private func names(_ mask: Int) -> String {
+        fingerZones.filter { mask & $0.id != 0 }.map { $0.name.uppercased() }.joined(separator: "\n+ ")
+    }
+
+    private func dots(_ mask: Int) -> some View {
+        HStack(spacing: 6) {
+            ForEach(fingerZones) { z in
+                Circle()
+                    .fill(mask & z.id != 0 ? z.color : z.color.opacity(0.10))
+                    .frame(width: 16, height: 16)
+                    .overlay(Circle().strokeBorder(z.color.opacity(0.5), lineWidth: 1))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func promptBlock(title: String, sub: String, mask: Int) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if mask != 0 { dots(mask) }
+            Text(title)
+                .font(.system(size: 17, weight: .black, design: .monospaced))
+                .foregroundColor(Color(white: 0.92))
+                .minimumScaleFactor(0.6)
+            Text(sub)
+                .font(.system(size: 10))
+                .foregroundColor(Color(white: 0.40))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var promptView: some View {
+        switch session.current {
+        case .placeThumb?:
+            promptBlock(title: "THUMB",
+                        sub: "Tap anywhere on the screen where your thumb rests. Your fingers will be placed relative to it.",
+                        mask: 0)
+        case .placeFinger(let f)?:
+            promptBlock(title: names(f),
+                        sub: "Rest your thumb on its button, then tap where this finger naturally sits — anywhere on screen",
+                        mask: f)
+        case .chord(let mask)?:
+            promptBlock(title: names(mask), sub: "Press these together", mask: mask)
+        case .thumbTap?:
+            promptBlock(title: "THUMB", sub: "Tap the thumb button", mask: 0)
+        case nil:
+            EmptyView()
+        }
+    }
+
+    private var finishedView: some View {
+        VStack(spacing: 16) {
+            Text("CALIBRATED")
+                .font(.system(size: 13, weight: .black, design: .monospaced))
+                .foregroundColor(Color(red: 0.94, green: 0.72, blue: 0.18)).tracking(3)
+            Text("Your layout now matches your hand.")
+                .font(.system(size: 13)).foregroundColor(Color(white: 0.50))
+            Text("Leave the scope toggle on in-game to keep refining it.")
+                .font(.system(size: 10)).foregroundColor(Color(white: 0.30))
+            HStack(spacing: 10) {
+                GameButton(label: "Defaults", color: Color(white: 0.18)) {
+                    calibration.reset(); haptic(.rigid)
+                }
+                GameButton(label: "Redo", color: Color(red: 0.22, green: 0.38, blue: 0.65)) {
+                    session.restart()
+                }
+                GameButton(label: "Done", color: Color(red: 0.18, green: 0.60, blue: 0.38), action: onExit)
+            }
+        }
+        .padding(28)
     }
 }
 
@@ -1471,17 +2093,21 @@ struct GameCompleteView: View {
 // MARK: - Root View
 
 struct IOSContentView: View {
-    @StateObject var game   = GameEngine()
-    @StateObject var engine = ChordEngine()
+    @StateObject var game        = GameEngine()
+    @StateObject var engine      = ChordEngine()
+    @StateObject var calibration = CalibrationModel()
 
     var body: some View {
         ZStack {
             Color(red: 0.06, green: 0.06, blue: 0.09).ignoresSafeArea()
             switch game.phase {
             case .intro:
-                LevelSelectView(game: game) { idx in game.startLevel(idx) }
+                LevelSelectView(game: game,
+                                onSelect:    { idx in game.startLevel(idx) },
+                                onCalibrate: { game.phase = .calibrating })
             case .playing:
-                PlayingView(game: game, engine: engine, onMenu: { game.phase = .intro })
+                PlayingView(game: game, engine: engine, calibration: calibration,
+                            onMenu: { game.phase = .intro })
             case .levelComplete:
                 LevelCompleteView(game: game,
                     onNext:  { game.startLevel(game.currentLevelIndex + 1) },
@@ -1489,10 +2115,19 @@ struct IOSContentView: View {
                     onMenu:  { game.phase = .intro })
             case .gameComplete:
                 GameCompleteView(game: game, onMenu: { game.phase = .intro })
+            case .calibrating:
+                CalibrationView(engine: engine, calibration: calibration,
+                                onExit: { game.phase = .intro })
             }
         }
         .preferredColorScheme(.dark)
-        .onAppear { AppDelegate.lockLandscape() }
+        .onAppear {
+            AppDelegate.lockLandscape()
+            game.onResult = { correct, expected in
+                calibration.learn(landings: engine.pendingLandings,
+                                  expectedMask: expected, correct: correct)
+            }
+        }
         .onChange(of: game.phase) { _, phase in
             guard phase == .playing else { return }
             engine.onLetter    = { game.receiveLetter($0) }
